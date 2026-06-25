@@ -1,0 +1,12 @@
+.DS_Store
+*.icns
+
+*.pyc
+*.pyi
+__pycache__/
+.venv
+
+dist/
+build/
+
+.vscode/PythonImportHelper*
