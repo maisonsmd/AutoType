@@ -20,37 +20,111 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-# pynput is imported once at module load to initialize Quartz on the main thread
-# before the Qt event loop starts — avoids a native crash on macOS when the
-# import happens later in a background thread.
-try:
-    from pynput.keyboard import Controller as _KeyboardController
-    logger.debug("pynput loaded on main thread")
-except Exception as _e:
-    _KeyboardController = None  # type: ignore[assignment,misc]
-    logger.warning(f"pynput unavailable: {_e}")
+# ---------------------------------------------------------------------------
+# Keyboard injection via CoreGraphics (no pyobjc / pynput needed)
+# ---------------------------------------------------------------------------
+
+_cg = ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+_cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+
+_cg.CGEventSourceCreate.restype = ctypes.c_void_p
+_cg.CGEventSourceCreate.argtypes = [ctypes.c_int]
+_cg.CGEventCreateKeyboardEvent.restype = ctypes.c_void_p
+_cg.CGEventCreateKeyboardEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint16, ctypes.c_bool]
+_cg.CGEventKeyboardSetUnicodeString.restype = None
+_cg.CGEventKeyboardSetUnicodeString.argtypes = [
+    ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_uint16)
+]
+_cg.CGEventPost.restype = None
+_cg.CGEventPost.argtypes = [ctypes.c_int, ctypes.c_void_p]
+_cf.CFRelease.restype = None
+_cf.CFRelease.argtypes = [ctypes.c_void_p]
+
+_CG_HID_EVENT_TAP = 0
+_CG_EVENT_SOURCE_STATE_HID = 1
+_cg_source = _cg.CGEventSourceCreate(_CG_EVENT_SOURCE_STATE_HID)
+
+# Virtual key codes for characters that need explicit keycodes
+_KEYCODES: dict[str, int] = {
+    "\n": 36,  # Return
+    "\r": 36,
+    "\t": 48,  # Tab
+}
+
+
+def _post_key(keycode: int, down: bool) -> None:
+    ev = _cg.CGEventCreateKeyboardEvent(_cg_source, keycode, down)
+    _cg.CGEventPost(_CG_HID_EVENT_TAP, ev)
+    _cf.CFRelease(ev)
+
+
+def _type_char(ch: str) -> None:
+    if ch in _KEYCODES:
+        kc = _KEYCODES[ch]
+        _post_key(kc, True)
+        _post_key(kc, False)
+    else:
+        buf = ch.encode("utf-16-le")
+        arr = (ctypes.c_uint16 * (len(buf) // 2)).from_buffer_copy(buf)
+        n = len(buf) // 2
+        for down in (True, False):
+            ev = _cg.CGEventCreateKeyboardEvent(_cg_source, 0, down)
+            _cg.CGEventKeyboardSetUnicodeString(ev, n, arr)
+            _cg.CGEventPost(_CG_HID_EVENT_TAP, ev)
+            _cf.CFRelease(ev)
+
+
+# ---------------------------------------------------------------------------
+# macOS ObjC helpers via ctypes (no pyobjc import, no event-loop conflict)
+# ---------------------------------------------------------------------------
+
+def _nsapp():
+    lib = ctypes.cdll.LoadLibrary(ctypes.util.find_library("objc"))
+    lib.objc_getClass.restype = ctypes.c_void_p
+    lib.objc_getClass.argtypes = [ctypes.c_char_p]
+    lib.sel_registerName.restype = ctypes.c_void_p
+    lib.sel_registerName.argtypes = [ctypes.c_char_p]
+    lib.objc_msgSend.restype = ctypes.c_void_p
+    lib.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    cls = lib.objc_getClass(b"NSApplication")
+    sel = lib.sel_registerName(b"sharedApplication")
+    return lib, lib.objc_msgSend(cls, sel)
+
+
+def _hide_from_dock() -> None:
+    try:
+        lib, app = _nsapp()
+        lib.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long]
+        lib.objc_msgSend(app, lib.sel_registerName(b"setActivationPolicy:"), 1)
+    except Exception as exc:
+        logger.warning(f"dock-hide failed: {exc}")
+
+
+def _activate_app() -> None:
+    try:
+        lib, app = _nsapp()
+        lib.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool]
+        lib.objc_msgSend(app, lib.sel_registerName(b"activateIgnoringOtherApps:"), True)
+    except Exception as exc:
+        logger.warning(f"activate failed: {exc}")
+
 
 def _is_accessibility_trusted() -> bool:
     try:
-        appserv = ctypes.cdll.LoadLibrary(
+        lib = ctypes.CDLL(
             ctypes.util.find_library("ApplicationServices")
             or "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
         )
-        appserv.AXIsProcessTrusted.restype = ctypes.c_bool
-        trusted = bool(appserv.AXIsProcessTrusted())
+        lib.AXIsProcessTrusted.restype = ctypes.c_bool
+        trusted = bool(lib.AXIsProcessTrusted())
         logger.debug(f"AXIsProcessTrusted: {trusted}")
         return trusted
     except Exception as exc:
-        logger.warning(f"Could not check accessibility: {exc}")
-        return True  # assume OK and let pynput fail with its own error
+        logger.warning(f"accessibility check failed: {exc}")
+        return True
 
 
-def _activate_app():
-    try:
-        from AppKit import NSApplication  # type: ignore[import]
-        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
-    except Exception:
-        pass
+# ---------------------------------------------------------------------------
 
 def _make_tray_icon(size: int = 64) -> QIcon:
     pix = QPixmap(size, size)
@@ -76,9 +150,6 @@ class PlainTextEdit(QTextEdit):
 
 
 class TypingController(QObject):
-    """Types characters one-per-timer-tick on the main thread (avoids macOS
-    native crash when pynput's CGEventSource is created in a background thread)."""
-
     progress = pyqtSignal(int, int)
     finished = pyqtSignal()
     error = pyqtSignal(str)
@@ -87,55 +158,38 @@ class TypingController(QObject):
         super().__init__(parent)
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._type_next)
-        self._kb = None
         self._chars: list[str] = []
         self._index = 0
         self._total = 0
 
-    def start(self, text: str, delay_ms: int):
+    def start(self, text: str, delay_ms: int) -> None:
         if not _is_accessibility_trusted():
             self.error.emit(
                 "Accessibility permission is required.\n\n"
                 "Open System Settings → Privacy & Security → Accessibility\n"
-                "and add your Terminal (or this app) to the list, then retry."
+                "and add AutoType (or Terminal) to the list, then retry."
             )
             return
-
-        if _KeyboardController is None:
-            self.error.emit("pynput failed to load — see logs for details.")
-            return
-
-        try:
-            logger.debug("Creating keyboard controller on main thread")
-            self._kb = _KeyboardController()
-            logger.debug("Keyboard controller created")
-        except Exception as exc:
-            logger.error(f"Controller() failed: {exc}")
-            self.error.emit(str(exc))
-            return
-
         self._chars = list(text)
         self._index = 0
         self._total = len(self._chars)
-        logger.debug(f"Starting typing {self._total} chars at {delay_ms}ms/char")
+        logger.debug(f"Typing {self._total} chars at {delay_ms} ms/char")
         self._timer.start(delay_ms)
 
-    def stop(self):
+    def stop(self) -> None:
         self._timer.stop()
-        self._kb = None
 
-    def _type_next(self):
-        assert self._kb is not None
+    def _type_next(self) -> None:
         if self._index >= self._total:
             self._timer.stop()
             self.finished.emit()
             return
         ch = self._chars[self._index]
         try:
-            self._kb.type(ch)
+            _type_char(ch)
         except Exception as exc:
             self._timer.stop()
-            logger.error(f"type() failed at char {self._index}: {exc}")
+            logger.error(f"_type_char failed at {self._index}: {exc}")
             self.error.emit(str(exc))
             return
         self._index += 1
@@ -240,12 +294,10 @@ class MainWindow(QWidget):
         if not text:
             self.status_label.setText("Enter some text first.")
             return
-
         self.start_btn.setEnabled(False)
         self.cancel_btn.setVisible(True)
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
-
         self._countdown_val = self.start_delay_spin.value()
         self._tick()
 
@@ -292,21 +344,18 @@ class MainWindow(QWidget):
         self.cancel_btn.setVisible(False)
 
     def _load_settings(self):
-        logger.info("Loading settings")
         self.text_edit.setPlainText(self._settings.value("text", ""))
         self.delay_spin.setValue(int(self._settings.value("char_delay_ms", 50)))
         self.start_delay_spin.setValue(int(self._settings.value("start_delay_s", 3)))
 
     def _save_settings(self):
-        logger.info("Saving settings")
         self._settings.setValue("text", self.text_edit.toPlainText())
         self._settings.setValue("char_delay_ms", self.delay_spin.value())
         self._settings.setValue("start_delay_s", self.start_delay_spin.value())
 
-    def closeEvent(self, a0):
+    def closeEvent(self, event):
         self._save_settings()
-        if a0:
-            a0.ignore()  # hide instead of close so tray keeps working
+        event.ignore()
         self.hide()
 
 
@@ -314,13 +363,7 @@ def main():
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
 
-    try:
-        from AppKit import NSApplication, NSApplicationActivationPolicyAccessory  # type: ignore[import]
-        NSApplication.sharedApplication().setActivationPolicy_(
-            NSApplicationActivationPolicyAccessory
-        )
-    except Exception as e:
-        print(f"[AppKit] skipped: {e}", flush=True)
+    _hide_from_dock()
 
     window = MainWindow()
 
@@ -329,7 +372,6 @@ def main():
     tray.setToolTip("AutoType")
 
     menu = QMenu()
-
     show_action = QAction("Show / Hide")
 
     def toggle_window():

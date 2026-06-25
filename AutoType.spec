@@ -1,23 +1,9 @@
-from PyInstaller.utils.hooks import collect_all
-
-# Collect pynput with all its platform backends and pyobjc deps
-pynput_datas, pynput_binaries, pynput_hidden = collect_all("pynput")
-quartz_datas, quartz_binaries, quartz_hidden = collect_all("Quartz")
-appserv_datas, appserv_binaries, appserv_hidden = collect_all("ApplicationServices")
-
 a = Analysis(
     ["src/autotype/main.py"],
     pathex=[],
-    binaries=[*pynput_binaries, *quartz_binaries, *appserv_binaries],
-    datas=[*pynput_datas, *quartz_datas, *appserv_datas],
-    hiddenimports=[
-        *pynput_hidden,
-        *quartz_hidden,
-        *appserv_hidden,
-        "AppKit",
-        "pynput.keyboard._darwin",
-        "pynput.mouse._darwin",
-    ],
+    binaries=[],
+    datas=[],
+    hiddenimports=[],
     hookspath=[],
     runtime_hooks=[],
     excludes=[],
@@ -57,7 +43,7 @@ app = BUNDLE(
     icon="AutoType.icns",
     bundle_identifier="com.autotype.app",
     info_plist={
-        "LSUIElement": True,             # hide from Dock
+        "LSUIElement": True,
         "NSHighResolutionCapable": True,
         "CFBundleName": "AutoType",
         "CFBundleDisplayName": "AutoType",
