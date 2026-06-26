@@ -7,10 +7,12 @@ from PyQt6.QtCore import QObject, QSettings, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QFrame,
     QHBoxLayout,
     QLabel,
     QMenu,
+    QMessageBox,
     QProgressBar,
     QPushButton,
     QSpinBox,
@@ -22,10 +24,18 @@ from PyQt6.QtWidgets import (
 
 # ---------------------------------------------------------------------------
 # Keyboard injection via CoreGraphics (no pyobjc / pynput needed)
+#
+# We post real virtual-keycode key events (with modifier flags) rather than
+# attaching a Unicode string to a keycode-0 event. The Unicode-string method
+# works for normal text fields but is ignored by apps that capture raw key
+# events — VNC/RDP viewers, games, terminals in some modes — because there is
+# no real key behind it. Mapping each character to its keycode+modifiers via
+# the active keyboard layout produces events those apps recognize.
 # ---------------------------------------------------------------------------
 
 _cg = ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
 _cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+_carbon = ctypes.CDLL("/System/Library/Frameworks/Carbon.framework/Carbon")
 
 _cg.CGEventSourceCreate.restype = ctypes.c_void_p
 _cg.CGEventSourceCreate.argtypes = [ctypes.c_int]
@@ -35,43 +45,140 @@ _cg.CGEventKeyboardSetUnicodeString.restype = None
 _cg.CGEventKeyboardSetUnicodeString.argtypes = [
     ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_uint16)
 ]
+_cg.CGEventSetFlags.restype = None
+_cg.CGEventSetFlags.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
 _cg.CGEventPost.restype = None
 _cg.CGEventPost.argtypes = [ctypes.c_int, ctypes.c_void_p]
 _cf.CFRelease.restype = None
 _cf.CFRelease.argtypes = [ctypes.c_void_p]
+_cf.CFDataGetBytePtr.restype = ctypes.c_void_p
+_cf.CFDataGetBytePtr.argtypes = [ctypes.c_void_p]
 
 _CG_HID_EVENT_TAP = 0
 _CG_EVENT_SOURCE_STATE_HID = 1
 _cg_source = _cg.CGEventSourceCreate(_CG_EVENT_SOURCE_STATE_HID)
 
-# Virtual key codes for characters that need explicit keycodes
-_KEYCODES: dict[str, int] = {
+# CGEventFlags masks
+_FLAG_SHIFT = 0x00020000
+_FLAG_OPTION = 0x00080000
+
+# Virtual keycodes for the modifier keys themselves. Apps that capture raw key
+# events (VNC/RDP) need a real modifier key-down/up — a flag on the character
+# event alone is ignored, so e.g. Shift+' would arrive as a plain '.
+_MOD_KEYCODES = [
+    (_FLAG_SHIFT, 56),   # left Shift
+    (_FLAG_OPTION, 58),  # left Option/Alt
+]
+
+# Virtual key codes for keys with no printable character of their own.
+_SPECIAL_KEYCODES: dict[str, int] = {
     "\n": 36,  # Return
     "\r": 36,
     "\t": 48,  # Tab
 }
 
+# Built lazily: char -> (virtual_keycode, cg_event_flags)
+_CHAR_MAP: dict[str, tuple[int, int]] | None = None
 
-def _post_key(keycode: int, down: bool) -> None:
+
+def _build_char_map() -> dict[str, tuple[int, int]]:
+    """Reverse-map characters to (keycode, flags) using the active layout."""
+    mapping: dict[str, tuple[int, int]] = {}
+    try:
+        _carbon.TISCopyCurrentKeyboardInputSource.restype = ctypes.c_void_p
+        _carbon.TISGetInputSourceProperty.restype = ctypes.c_void_p
+        _carbon.TISGetInputSourceProperty.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        _carbon.LMGetKbdType.restype = ctypes.c_uint8
+        _carbon.UCKeyTranslate.restype = ctypes.c_int32
+        _carbon.UCKeyTranslate.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint16, ctypes.c_uint16, ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32),
+            ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_uint16),
+        ]
+        prop = ctypes.c_void_p.in_dll(_carbon, "kTISPropertyUnicodeKeyLayoutData")
+
+        src = _carbon.TISCopyCurrentKeyboardInputSource()
+        layout_data = _carbon.TISGetInputSourceProperty(src, prop)
+        if not layout_data:
+            return mapping
+        layout_ptr = _cf.CFDataGetBytePtr(layout_data)
+        kbd_type = _carbon.LMGetKbdType()
+
+        # UCKeyTranslate modifier state is (EventModifiers >> 8): shift=0x02, option=0x08
+        mod_states = [
+            (0x00, 0),
+            (0x02, _FLAG_SHIFT),
+            (0x08, _FLAG_OPTION),
+            (0x0A, _FLAG_SHIFT | _FLAG_OPTION),
+        ]
+        for keycode in range(128):
+            for uc_mods, cg_flags in mod_states:
+                dead = ctypes.c_uint32(0)
+                buf = (ctypes.c_uint16 * 8)()
+                length = ctypes.c_ulong(0)
+                status = _carbon.UCKeyTranslate(
+                    layout_ptr, keycode, 0, uc_mods, kbd_type,
+                    1,  # kUCKeyTranslateNoDeadKeysMask
+                    ctypes.byref(dead), 8, ctypes.byref(length), buf,
+                )
+                if status != 0 or length.value != 1:
+                    continue
+                ch = chr(buf[0])
+                if ch.isprintable() and ch not in mapping:
+                    mapping[ch] = (keycode, cg_flags)
+    except Exception as exc:
+        logger.warning(f"could not build keycode map: {exc}")
+    logger.debug(f"keycode map built: {len(mapping)} chars")
+    return mapping
+
+
+def _post_key(keycode: int, flags: int, down: bool) -> None:
     ev = _cg.CGEventCreateKeyboardEvent(_cg_source, keycode, down)
+    # Always set flags explicitly (incl. 0) so the event doesn't inherit the
+    # real hardware modifier state at post time.
+    _cg.CGEventSetFlags(ev, flags)
     _cg.CGEventPost(_CG_HID_EVENT_TAP, ev)
     _cf.CFRelease(ev)
 
 
+def _type_unicode(ch: str) -> None:
+    """Fallback for characters with no key on the current layout (emoji, etc.)."""
+    buf = ch.encode("utf-16-le")
+    n = len(buf) // 2
+    arr = (ctypes.c_uint16 * n).from_buffer_copy(buf)
+    for down in (True, False):
+        ev = _cg.CGEventCreateKeyboardEvent(_cg_source, 0, down)
+        _cg.CGEventKeyboardSetUnicodeString(ev, n, arr)
+        _cg.CGEventPost(_CG_HID_EVENT_TAP, ev)
+        _cf.CFRelease(ev)
+
+
 def _type_char(ch: str) -> None:
-    if ch in _KEYCODES:
-        kc = _KEYCODES[ch]
-        _post_key(kc, True)
-        _post_key(kc, False)
+    global _CHAR_MAP
+    if ch in _SPECIAL_KEYCODES:
+        _post_key(_SPECIAL_KEYCODES[ch], 0, True)
+        _post_key(_SPECIAL_KEYCODES[ch], 0, False)
+        return
+    if _CHAR_MAP is None:
+        _CHAR_MAP = _build_char_map()
+    entry = _CHAR_MAP.get(ch)
+    if entry is not None:
+        keycode, flags = entry
+        # Press the required modifier keys first, accumulating their flags, so
+        # raw-key-capture apps (VNC) see a genuine Shift/Option key-down.
+        held = 0
+        mods = [(bit, kc) for bit, kc in _MOD_KEYCODES if flags & bit]
+        for bit, kc in mods:
+            held |= bit
+            _post_key(kc, held, True)
+        _post_key(keycode, held, True)
+        _post_key(keycode, held, False)
+        for bit, kc in reversed(mods):
+            held &= ~bit
+            _post_key(kc, held, False)
     else:
-        buf = ch.encode("utf-16-le")
-        arr = (ctypes.c_uint16 * (len(buf) // 2)).from_buffer_copy(buf)
-        n = len(buf) // 2
-        for down in (True, False):
-            ev = _cg.CGEventCreateKeyboardEvent(_cg_source, 0, down)
-            _cg.CGEventKeyboardSetUnicodeString(ev, n, arr)
-            _cg.CGEventPost(_CG_HID_EVENT_TAP, ev)
-            _cf.CFRelease(ev)
+        _type_unicode(ch)
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +186,7 @@ def _type_char(ch: str) -> None:
 # ---------------------------------------------------------------------------
 
 def _nsapp():
-    lib = ctypes.cdll.LoadLibrary(ctypes.util.find_library("objc"))
+    lib = ctypes.cdll.LoadLibrary(ctypes.util.find_library("objc")) # type: ignore
     lib.objc_getClass.restype = ctypes.c_void_p
     lib.objc_getClass.argtypes = [ctypes.c_char_p]
     lib.sel_registerName.restype = ctypes.c_void_p
@@ -109,12 +216,16 @@ def _activate_app() -> None:
         logger.warning(f"activate failed: {exc}")
 
 
+def _appservices():
+    return ctypes.CDLL(
+        ctypes.util.find_library("ApplicationServices")
+        or "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
+    )
+
+
 def _is_accessibility_trusted() -> bool:
     try:
-        lib = ctypes.CDLL(
-            ctypes.util.find_library("ApplicationServices")
-            or "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
-        )
+        lib = _appservices()
         lib.AXIsProcessTrusted.restype = ctypes.c_bool
         trusted = bool(lib.AXIsProcessTrusted())
         logger.debug(f"AXIsProcessTrusted: {trusted}")
@@ -122,6 +233,42 @@ def _is_accessibility_trusted() -> bool:
     except Exception as exc:
         logger.warning(f"accessibility check failed: {exc}")
         return True
+
+
+def _request_accessibility() -> bool:
+    """Check trust, asking macOS to show its native permission dialog if not.
+
+    Uses AXIsProcessTrustedWithOptions with kAXTrustedCheckOptionPrompt=true,
+    which presents the system prompt with an "Open System Settings" button.
+    """
+    try:
+        lib = _appservices()
+        lib.AXIsProcessTrustedWithOptions.restype = ctypes.c_bool
+        lib.AXIsProcessTrustedWithOptions.argtypes = [ctypes.c_void_p]
+
+        prompt_key = ctypes.c_void_p.in_dll(lib, "kAXTrustedCheckOptionPrompt")
+        true_val = ctypes.c_void_p.in_dll(_cf, "kCFBooleanTrue")
+
+        _cf.CFDictionaryCreate.restype = ctypes.c_void_p
+        _cf.CFDictionaryCreate.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_long,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        keys = (ctypes.c_void_p * 1)(prompt_key)
+        vals = (ctypes.c_void_p * 1)(true_val)
+        opts = _cf.CFDictionaryCreate(None, keys, vals, 1, None, None)
+        trusted = bool(lib.AXIsProcessTrustedWithOptions(opts))
+        if opts:
+            _cf.CFRelease(opts)
+        logger.debug(f"AXIsProcessTrustedWithOptions(prompt): {trusted}")
+        return trusted
+    except Exception as exc:
+        logger.warning(f"accessibility prompt failed: {exc}")
+        return _is_accessibility_trusted()
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +403,10 @@ class MainWindow(QWidget):
         row.addWidget(self.start_delay_spin)
         root.addLayout(row)
 
+        self.hide_on_start_check = QCheckBox("Hide window when typing starts")
+        self.hide_on_start_check.setChecked(True)
+        root.addWidget(self.hide_on_start_check)
+
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         root.addWidget(self.progress_bar)
@@ -299,6 +450,9 @@ class MainWindow(QWidget):
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         self._countdown_val = self.start_delay_spin.value()
+        self._save_settings()
+        if self.hide_on_start_check.isChecked():
+            self.hide()  # get out of the way; the countdown runs in the background
         self._tick()
 
     def _tick(self):
@@ -347,15 +501,20 @@ class MainWindow(QWidget):
         self.text_edit.setPlainText(self._settings.value("text", ""))
         self.delay_spin.setValue(int(self._settings.value("char_delay_ms", 50)))
         self.start_delay_spin.setValue(int(self._settings.value("start_delay_s", 3)))
+        self.hide_on_start_check.setChecked(
+            self._settings.value("hide_on_start", True, type=bool)
+        )
 
     def _save_settings(self):
         self._settings.setValue("text", self.text_edit.toPlainText())
         self._settings.setValue("char_delay_ms", self.delay_spin.value())
         self._settings.setValue("start_delay_s", self.start_delay_spin.value())
+        self._settings.setValue("hide_on_start", self.hide_on_start_check.isChecked())
 
-    def closeEvent(self, event):
+    def closeEvent(self, a0):
         self._save_settings()
-        event.ignore()
+        if a0:
+            a0.ignore()
         self.hide()
 
 
@@ -398,6 +557,24 @@ def main():
         else None
     )
     tray.show()
+
+    # On launch, make sure we have Accessibility permission. If not, trigger the
+    # native macOS prompt and explain in a dialog (the permission only takes
+    # effect after the app is relaunched).
+    if not _request_accessibility():
+        box = QMessageBox()
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Accessibility permission required")
+        box.setText("AutoType needs Accessibility permission to type for you.")
+        box.setInformativeText(
+            "macOS should have just shown a permission prompt. Open\n"
+            "System Settings > Privacy & Security > Accessibility,\n"
+            "enable AutoType, then quit and reopen the app.\n\n"
+            "Until then, typing will not work."
+        )
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        _activate_app()
+        box.exec()
 
     sys.exit(app.exec())
 
